@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Power Stabiliser GUI
-- Controls the Arduino-based power stabiliser (enable/disable, set point capture)
+- Controls the Arduino-based power stabiliser (enable/disable, set point capture, calibration)
 - Connects to a PM16 power meter via orca_drivers
-- Plots live power readings
+- Plots live power readings and attenuator calibration curve
 """
 
 import tkinter as tk
@@ -34,15 +34,17 @@ class StabiliserSerial:
     """
     Manages serial communication with the Arduino power stabiliser.
 
-    The Arduino sends continuous lines of the form:
-        Photodiode: 1234 | Reference: 1300 | Attenuator: 2048
-    Sending "set\\n" tells the Arduino to capture the current photodiode
-    reading as the new reference set point.
+    Normal output:   Photodiode: 1234 | Reference: 1300 | Attenuator: 2048
+    Calibration:     send 'cal\\n'  → Arduino streams  DAC,ADC  CSV lines,
+                     ending with a line containing '# Calibration complete'.
+    Set point:       send 'set\\n'  → Arduino captures current reading as reference.
     """
 
-    _PATTERN = re.compile(
+    _STATUS_PATTERN = re.compile(
         r"Photodiode:\s*(\d+)\s*\|\s*Reference:\s*(\d+)\s*\|\s*Attenuator:\s*(\d+)"
     )
+    _CAL_PATTERN = re.compile(r"^(\d+),(\d+)$")
+    _CAL_DONE_MARKER = "# Calibration complete"
 
     def __init__(self):
         self.ser: serial.Serial | None = None
@@ -51,6 +53,16 @@ class StabiliserSerial:
         self._data: dict = {"photodiode": None, "reference": None, "attenuator": None}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+        # Calibration state
+        self._calibrating = False
+        self._cal_data: list[tuple[int, int]] = []
+        self._cal_done = threading.Event()
+
+        # Raw terminal buffer (last 2000 lines)
+        self._raw_lines: deque[str] = deque(maxlen=2000)
+
+    # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self, port: str, baud: int = 9600) -> tuple[bool, str]:
         try:
@@ -81,36 +93,84 @@ class StabiliserSerial:
         with self._lock:
             self._data = {"photodiode": None, "reference": None, "attenuator": None}
 
-    def send_set(self):
-        """Send the 'set' command to capture the current reading as set point."""
+    # ── Commands ──────────────────────────────────────────────────────────────
+
+    def send_get(self):
+        """Request a single status snapshot from the Arduino."""
         if self.connected and self.ser and self.ser.is_open:
-            with self._lock:
-                self.ser.write(b"set\n")
+            self.ser.write(b"get\n")
+
+    def send_set(self):
+        """Capture current photodiode reading as the reference set point."""
+        if self.connected and self.ser and self.ser.is_open:
+            self.ser.write(b"set\n")
+
+    def send_cal(self):
+        """Start a calibration sweep. Poll get_cal_result() for completion."""
+        if not (self.connected and self.ser and self.ser.is_open):
+            return
+        with self._lock:
+            self._cal_data = []
+            self._calibrating = True
+        self._cal_done.clear()
+        self.ser.write(b"cal\n")
+
+    # ── Data accessors ────────────────────────────────────────────────────────
 
     def get_data(self) -> dict:
         with self._lock:
             return dict(self._data)
+
+    def get_cal_result(self) -> tuple[bool, list[tuple[int, int]]]:
+        """Return (done, [(dac, adc), ...]).  done=True once sweep is complete."""
+        done = self._cal_done.is_set()
+        with self._lock:
+            data = list(self._cal_data)
+        return done, data
+
+    def drain_raw_lines(self) -> list[str]:
+        """Return and clear all buffered raw lines since the last call."""
+        with self._lock:
+            lines = list(self._raw_lines)
+            self._raw_lines.clear()
+        return lines
+
+    # ── Serial read loop ──────────────────────────────────────────────────────
 
     def _read_loop(self):
         while not self._stop.is_set():
             try:
                 if self.ser and self.ser.in_waiting > 0:
                     line = self.ser.readline().decode("ascii", errors="replace").strip()
-                    m = self._PATTERN.search(line)
-                    if m:
-                        with self._lock:
-                            self._data = {
-                                "photodiode": int(m.group(1)),
-                                "reference":  int(m.group(2)),
-                                "attenuator": int(m.group(3)),
-                            }
+                    with self._lock:
+                        self._raw_lines.append(line)
+                        in_cal = self._calibrating
+
+                    if in_cal:
+                        m = self._CAL_PATTERN.match(line)
+                        if m:
+                            with self._lock:
+                                self._cal_data.append((int(m.group(1)), int(m.group(2))))
+                        elif self._CAL_DONE_MARKER in line:
+                            with self._lock:
+                                self._calibrating = False
+                            self._cal_done.set()
+                    else:
+                        m = self._STATUS_PATTERN.search(line)
+                        if m:
+                            with self._lock:
+                                self._data = {
+                                    "photodiode": int(m.group(1)),
+                                    "reference":  int(m.group(2)),
+                                    "attenuator": int(m.group(3)),
+                                }
             except Exception:
                 pass
             time.sleep(0.05)
 
 
 class PM16Controller:
-    """Wraps the orca_drivers PM16 driver for use from a GUI thread."""
+    """Wraps the orca_drivers PM16 driver for use from the GUI thread."""
 
     def __init__(self):
         self.pm: PM16 | None = None
@@ -199,7 +259,7 @@ class StabiliserGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Power Stabiliser Control")
-        self.root.minsize(900, 480)
+        self.root.minsize(950, 520)
 
         self.stabiliser = StabiliserSerial()
         self.pm = PM16Controller()
@@ -207,6 +267,7 @@ class StabiliserGUI:
         self._power_times: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
         self._power_values: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
         self._t0: float | None = None
+        self._calibrating_ui = False   # tracks whether cal is in progress in the GUI
 
         self._build_ui()
         self._schedule_update()
@@ -222,7 +283,7 @@ class StabiliserGUI:
 
         self._build_stabiliser_panel(controls)
         self._build_pm_panel(controls)
-        self._build_plot(outer)
+        self._build_plots(outer)
 
         self._refresh_ports()
 
@@ -249,23 +310,28 @@ class StabiliserGUI:
                                        fg="red", font=("TkDefaultFont", 9))
         self._stab_conn_lbl.pack(side=tk.LEFT, padx=6)
 
+        # Get (single snapshot)
+        self._stab_get_btn = ttk.Button(frame, text="Get",
+                                        command=self._send_get,
+                                        state=tk.DISABLED)
+        self._stab_get_btn.pack(fill=tk.X, pady=(0, 4))
+
         # Enable / disable
         self._stab_en_btn = ttk.Button(frame, text="Enable Stabiliser",
                                        command=self._toggle_stab_enable,
                                        state=tk.DISABLED)
-        self._stab_en_btn.pack(fill=tk.X, pady=(0, 6))
+        self._stab_en_btn.pack(fill=tk.X, pady=(0, 4))
         self._stab_enabled = False
 
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
-        # Readings grid
+        # Readings
         grid = ttk.Frame(frame)
         grid.pack(fill=tk.X)
-
         labels = ["Photodiode:", "Reference (setpoint):", "Attenuator:", "Error:"]
         self._stab_vars = {}
-        keys = ["photodiode", "reference", "attenuator", "error"]
-        for i, (lbl, key) in enumerate(zip(labels, keys)):
+        for i, (lbl, key) in enumerate(zip(labels,
+                                           ["photodiode", "reference", "attenuator", "error"])):
             ttk.Label(grid, text=lbl, anchor=tk.W).grid(row=i, column=0, sticky=tk.W, pady=1)
             var = tk.StringVar(value="—")
             ttk.Label(grid, textvariable=var, width=10, anchor=tk.E).grid(
@@ -274,14 +340,23 @@ class StabiliserGUI:
 
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        # Set point capture
+        # Set point + Calibrate
         sp_row = ttk.Frame(frame)
-        sp_row.pack(fill=tk.X)
+        sp_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(sp_row, text="Set point:").pack(side=tk.LEFT)
         self._stab_set_btn = ttk.Button(sp_row, text="Capture current →",
                                         command=self._capture_setpoint,
                                         state=tk.DISABLED)
         self._stab_set_btn.pack(side=tk.LEFT, padx=6)
+
+        self._cal_btn = ttk.Button(frame, text="Calibrate",
+                                   command=self._run_calibration,
+                                   state=tk.DISABLED)
+        self._cal_btn.pack(fill=tk.X)
+
+        self._cal_status_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self._cal_status_var,
+                  foreground="gray", font=("TkDefaultFont", 8)).pack(anchor=tk.W)
 
     def _build_pm_panel(self, parent):
         frame = ttk.LabelFrame(parent, text=" Power Meter (PM16) ", padding=8)
@@ -292,9 +367,15 @@ class StabiliserGUI:
                       foreground="gray").pack()
             return
 
-        ttk.Label(frame, text="VISA address:").pack(anchor=tk.W)
-        self._visa_var = tk.StringVar(value="USB0::0x1313::0x807B::240426527::INSTR")
-        ttk.Entry(frame, textvariable=self._visa_var, width=38).pack(fill=tk.X, pady=(2, 6))
+        visa_lbl_row = ttk.Frame(frame)
+        visa_lbl_row.pack(fill=tk.X)
+        ttk.Label(visa_lbl_row, text="VISA device:").pack(side=tk.LEFT)
+        ttk.Button(visa_lbl_row, text="↺", width=3,
+                   command=self._refresh_visa_resources).pack(side=tk.RIGHT)
+        self._visa_var = tk.StringVar()
+        self._visa_combo = ttk.Combobox(frame, textvariable=self._visa_var, width=38)
+        self._visa_combo.pack(fill=tk.X, pady=(2, 6))
+        self._refresh_visa_resources()
 
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, pady=(0, 4))
@@ -320,25 +401,93 @@ class StabiliserGUI:
         ttk.Label(pw_row, textvariable=self._power_var,
                   font=("TkDefaultFont", 11, "bold")).pack(side=tk.LEFT, padx=6)
 
-        # Clear plot button
-        ttk.Button(frame, text="Clear plot", command=self._clear_plot).pack(
-            fill=tk.X, pady=(6, 0))
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
-    def _build_plot(self, parent):
-        plot_frame = ttk.LabelFrame(parent, text=" Power vs Time ", padding=4)
-        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Statistics over last N seconds
+        stats_grid = ttk.Frame(frame)
+        stats_grid.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(stats_grid, text="Stats window:").grid(row=0, column=0, sticky=tk.W)
+        self._stats_window_var = tk.DoubleVar(value=10.0)
+        ttk.Spinbox(stats_grid, from_=1, to=3600, increment=1, width=6,
+                    textvariable=self._stats_window_var).grid(row=0, column=1, padx=4)
+        ttk.Label(stats_grid, text="s").grid(row=0, column=2, sticky=tk.W)
 
-        self._fig = Figure(figsize=(6, 4), dpi=100)
-        self._ax = self._fig.add_subplot(111)
-        self._ax.set_xlabel("Time (s)")
-        self._ax.set_ylabel("Power (mW)")
-        self._ax.set_title("PM16 Live Power")
-        (self._line,) = self._ax.plot([], [], "b-", linewidth=1)
-        self._fig.tight_layout()
+        ttk.Label(stats_grid, text="Mean:").grid(row=1, column=0, sticky=tk.W, pady=1)
+        self._mean_var = tk.StringVar(value="— mW")
+        ttk.Label(stats_grid, textvariable=self._mean_var).grid(row=1, column=1,
+                                                                 columnspan=2, sticky=tk.W)
+        ttk.Label(stats_grid, text="Std dev:").grid(row=2, column=0, sticky=tk.W, pady=1)
+        self._std_var = tk.StringVar(value="— mW")
+        ttk.Label(stats_grid, textvariable=self._std_var).grid(row=2, column=1,
+                                                                columnspan=2, sticky=tk.W)
 
-        self._canvas = FigureCanvasTkAgg(self._fig, master=plot_frame)
-        self._canvas.draw()
-        self._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        ttk.Button(frame, text="Clear plot", command=self._clear_power_plot).pack(
+            fill=tk.X, pady=(4, 0))
+
+    def _build_plots(self, parent):
+        """Two-tab notebook: Power vs Time  |  Calibration."""
+        self._notebook = ttk.Notebook(parent)
+        self._notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # ── Tab 1: Power ──────────────────────────────────────────────────────
+        power_tab = ttk.Frame(self._notebook)
+        self._notebook.add(power_tab, text="  Power vs Time  ")
+
+        self._fig_power = Figure(figsize=(6, 4), dpi=100)
+        self._ax_power = self._fig_power.add_subplot(111)
+        self._ax_power.set_xlabel("Time (s)")
+        self._ax_power.set_ylabel("Power (mW)")
+        self._ax_power.set_title("PM16 Live Power")
+        (self._power_line,) = self._ax_power.plot([], [], "b-", linewidth=1)
+        self._fig_power.tight_layout()
+
+        canvas_power = FigureCanvasTkAgg(self._fig_power, master=power_tab)
+        canvas_power.draw()
+        canvas_power.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas_power = canvas_power
+
+        # ── Tab 3: Arduino terminal ───────────────────────────────────────────
+        term_tab = ttk.Frame(self._notebook)
+        self._notebook.add(term_tab, text="  Arduino Terminal  ")
+
+        self._term_text = tk.Text(
+            term_tab, state=tk.DISABLED, wrap=tk.NONE,
+            bg="#1e1e1e", fg="#d4d4d4",
+            font=("Courier New", 9),
+            relief=tk.FLAT,
+        )
+        term_scroll_y = ttk.Scrollbar(term_tab, orient=tk.VERTICAL,
+                                      command=self._term_text.yview)
+        term_scroll_x = ttk.Scrollbar(term_tab, orient=tk.HORIZONTAL,
+                                      command=self._term_text.xview)
+        self._term_text.configure(yscrollcommand=term_scroll_y.set,
+                                  xscrollcommand=term_scroll_x.set)
+        term_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        term_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self._term_text.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Button(term_tab, text="Clear",
+                   command=self._clear_terminal).place(relx=1.0, rely=0.0,
+                                                       anchor="ne", x=-20, y=2)
+
+        # ── Tab 2: Calibration ────────────────────────────────────────────────
+        cal_tab = ttk.Frame(self._notebook)
+        self._notebook.add(cal_tab, text="  Calibration  ")
+
+        self._fig_cal = Figure(figsize=(6, 4), dpi=100)
+        self._ax_cal = self._fig_cal.add_subplot(111)
+        self._ax_cal.set_xlabel("Attenuator (DAC)")
+        self._ax_cal.set_ylabel("Photodiode (ADC)")
+        self._ax_cal.set_title("Attenuator Calibration")
+        self._ax_cal.text(0.5, 0.5, "Run calibration to populate this plot",
+                          ha="center", va="center", transform=self._ax_cal.transAxes,
+                          color="gray")
+        self._fig_cal.tight_layout()
+
+        canvas_cal = FigureCanvasTkAgg(self._fig_cal, master=cal_tab)
+        canvas_cal.draw()
+        canvas_cal.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas_cal = canvas_cal
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -348,16 +497,32 @@ class StabiliserGUI:
         if ports and not self._port_var.get():
             self._port_var.set(ports[0])
 
+    def _refresh_visa_resources(self):
+        try:
+            import pyvisa
+            rm = pyvisa.ResourceManager()
+            resources = list(rm.list_resources())
+            rm.close()
+        except Exception:
+            resources = []
+        self._visa_combo["values"] = resources
+        if resources and not self._visa_var.get():
+            self._visa_var.set(resources[0])
+
     def _set_stab_connected(self, connected: bool):
         if connected:
             self._stab_conn_btn.config(text="Disconnect")
             self._stab_conn_lbl.config(text="● Connected", fg="#008800")
+            self._stab_get_btn.config(state=tk.NORMAL)
             self._stab_en_btn.config(state=tk.NORMAL)
         else:
             self._stab_conn_btn.config(text="Connect")
             self._stab_conn_lbl.config(text="● Disconnected", fg="red")
+            self._stab_get_btn.config(state=tk.DISABLED)
             self._stab_en_btn.config(text="Enable Stabiliser", state=tk.DISABLED)
             self._stab_set_btn.config(state=tk.DISABLED)
+            self._cal_btn.config(state=tk.DISABLED)
+            self._cal_status_var.set("")
             self._stab_enabled = False
             for var in self._stab_vars.values():
                 var.set("—")
@@ -398,16 +563,32 @@ class StabiliserGUI:
         if self._stab_enabled:
             self._stab_en_btn.config(text="Disable Stabiliser")
             self._stab_set_btn.config(state=tk.NORMAL)
+            self._cal_btn.config(state=tk.NORMAL)
         else:
             self._stab_en_btn.config(text="Enable Stabiliser")
             self._stab_set_btn.config(state=tk.DISABLED)
+            self._cal_btn.config(state=tk.DISABLED)
+
+    def _send_get(self):
+        self.stabiliser.send_get()
 
     def _capture_setpoint(self):
-        """Send 'set' to Arduino — captures current photodiode reading as reference."""
         if not self.stabiliser.connected:
             messagebox.showwarning("Not connected", "Connect to stabiliser first.")
             return
         self.stabiliser.send_set()
+
+    def _run_calibration(self):
+        if not self.stabiliser.connected:
+            messagebox.showwarning("Not connected", "Connect to stabiliser first.")
+            return
+        if self._calibrating_ui:
+            return
+        self._calibrating_ui = True
+        self._cal_btn.config(state=tk.DISABLED, text="Calibrating…")
+        self._stab_get_btn.config(state=tk.DISABLED)
+        self._cal_status_var.set("Sweep in progress…")
+        self.stabiliser.send_cal()
 
     # ── Power meter actions ───────────────────────────────────────────────────
 
@@ -444,14 +625,60 @@ class StabiliserGUI:
             self._pm_enabled = False
             self._pm_en_btn.config(text="Enable Measurements")
 
-    def _clear_plot(self):
+    def _clear_terminal(self):
+        self._term_text.config(state=tk.NORMAL)
+        self._term_text.delete("1.0", tk.END)
+        self._term_text.config(state=tk.DISABLED)
+
+    def _clear_power_plot(self):
         self._power_times.clear()
         self._power_values.clear()
         if self._t0 is not None:
             self._t0 = time.time()
-        self._line.set_data([], [])
-        self._ax.relim()
-        self._canvas.draw_idle()
+        self._power_line.set_data([], [])
+        if hasattr(self, "_stats_hlines"):
+            for artist in self._stats_hlines:
+                artist.remove()
+            self._stats_hlines = []
+        self._ax_power.legend().remove() if self._ax_power.get_legend() else None
+        self._mean_var.set("— mW")
+        self._std_var.set("— mW")
+        self._ax_power.relim()
+        self._canvas_power.draw_idle()
+
+    # ── Calibration plot ──────────────────────────────────────────────────────
+
+    def _draw_calibration_plot(self, data: list[tuple[int, int]]):
+        if not data:
+            return
+
+        dac_vals = [d for d, _ in data]
+        adc_vals = [a for _, a in data]
+        max_adc = max(adc_vals)
+        half_max = max_adc / 2.0
+
+        # Find the DAC value where photodiode first drops to half-max
+        half_dac = None
+        for dac, adc in data:
+            if adc <= half_max:
+                half_dac = dac
+                break
+
+        ax = self._ax_cal
+        ax.clear()
+        ax.plot(dac_vals, adc_vals, "b-o", linewidth=1.5, markersize=4, label="PD response")
+        ax.axhline(half_max, color="orange", linestyle="--", linewidth=1,
+                   label=f"Half-max ({half_max:.0f} ADC)")
+        if half_dac is not None:
+            ax.axvline(half_dac, color="green", linestyle="--", linewidth=1,
+                       label=f"50 % point (DAC={half_dac})")
+
+        ax.set_xlabel("Attenuator (DAC)")
+        ax.set_ylabel("Photodiode (ADC)")
+        ax.set_title("Attenuator Calibration")
+        ax.legend(fontsize=8)
+        self._fig_cal.tight_layout()
+        self._canvas_cal.draw_idle()
 
     # ── Periodic update ───────────────────────────────────────────────────────
 
@@ -460,8 +687,10 @@ class StabiliserGUI:
         self.root.after(UPDATE_INTERVAL_MS, self._schedule_update)
 
     def _update(self):
-        # Stabiliser readings
-        if self.stabiliser.connected and self._stab_enabled:
+        # Stabiliser readings — auto-poll 'get' since the Arduino no longer
+        # streams continuously; the response is parsed by the existing read loop.
+        if self.stabiliser.connected and self._stab_enabled and not self._calibrating_ui:
+            self.stabiliser.send_get()
             d = self.stabiliser.get_data()
             pd  = d["photodiode"]
             ref = d["reference"]
@@ -472,6 +701,27 @@ class StabiliserGUI:
                 self._stab_vars["attenuator"].set(str(att))
                 self._stab_vars["error"].set(str(ref - pd) if ref is not None else "—")
 
+        # Calibration completion check
+        if self._calibrating_ui:
+            done, data = self.stabiliser.get_cal_result()
+            if done:
+                self._calibrating_ui = False
+                self._cal_btn.config(state=tk.NORMAL, text="Calibrate")
+                self._stab_get_btn.config(state=tk.NORMAL)
+                self._cal_status_var.set(f"Done — {len(data)} points")
+                self._draw_calibration_plot(data)
+                self._notebook.select(2)   # switch to Calibration tab
+
+        # Arduino terminal
+        if self.stabiliser.connected:
+            new_lines = self.stabiliser.drain_raw_lines()
+            if new_lines:
+                self._term_text.config(state=tk.NORMAL)
+                for line in new_lines:
+                    self._term_text.insert(tk.END, line + "\n")
+                self._term_text.see(tk.END)
+                self._term_text.config(state=tk.DISABLED)
+
         # Power meter
         if self._pm_enabled:
             p_w = self.pm.get_power()
@@ -480,17 +730,48 @@ class StabiliserGUI:
             t = time.time() - self._t0
             self._power_times.append(t)
             self._power_values.append(p_mw)
-            self._update_plot()
+            self._update_power_plot()
 
-    def _update_plot(self):
+    def _update_power_plot(self):
         if not self._power_times:
             return
-        xs = list(self._power_times)
-        ys = list(self._power_values)
-        self._line.set_data(xs, ys)
-        self._ax.relim()
-        self._ax.autoscale_view()
-        self._canvas.draw_idle()
+
+        times = list(self._power_times)
+        values = list(self._power_values)
+        self._power_line.set_data(times, values)
+        self._ax_power.relim()
+        self._ax_power.autoscale_view()
+
+        # ── Statistics over the last N seconds ───────────────────────────────
+        try:
+            window = float(self._stats_window_var.get())
+        except (tk.TclError, ValueError):
+            window = 10.0
+        t_now = times[-1]
+        window_vals = [v for t, v in zip(times, values) if t >= t_now - window]
+
+        if window_vals:
+            mean = sum(window_vals) / len(window_vals)
+            variance = sum((v - mean) ** 2 for v in window_vals) / len(window_vals)
+            std = variance ** 0.5
+            self._mean_var.set(f"{mean:.4f} mW")
+            self._std_var.set(f"{std:.4f} mW")
+
+            # Annotate plot with mean ± std band
+            if hasattr(self, "_stats_hlines"):
+                for artist in self._stats_hlines:
+                    artist.remove()
+            mean_line = self._ax_power.axhline(
+                mean, color="orange", linestyle="--", linewidth=1, label=f"Mean ({mean:.4f} mW)")
+            band = self._ax_power.axhspan(
+                mean - std, mean + std, alpha=0.12, color="orange",
+                label=f"±1σ ({std:.4f} mW)")
+            self._stats_hlines = [mean_line, band]
+
+            # Refresh legend
+            self._ax_power.legend(fontsize=7, loc="upper left")
+
+        self._canvas_power.draw_idle()
 
     def cleanup(self):
         self.stabiliser.disconnect()
@@ -502,7 +783,7 @@ class StabiliserGUI:
 def main():
     root = tk.Tk()
     app = StabiliserGUI(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (_cleanup(app, root)))
+    root.protocol("WM_DELETE_WINDOW", lambda: _cleanup(app, root))
     root.mainloop()
 
 

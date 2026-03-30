@@ -4,13 +4,13 @@
 
 // Pin definitions
 const int attenuatorPin = A0;     // Analog output to attenuator (A0)
-const int photodiodePin = A2;     // Analog input from photodiode (A2)
+const int photodiodePin = A1;     // Analog input from photodiode (A2)
 
 // Control parameters
 int attenuatorValue = 2048;       // Start at half (0-4095 for 12-bit)
 int referenceValue = 0;           // Reference photodiode voltage
-const int tolerance = 20;         // Acceptable deviation (12-bit scale)
-const int step = 10;              // Step size for adjustment (12-bit scale)
+const int tolerance = 1;         // Acceptable deviation (12-bit scale)
+const int step = 1;              // Step size for adjustment (12-bit scale)
 
 #if defined(__AVR__)
   const int DAC_MAX = 255;
@@ -27,8 +27,10 @@ void calibrate() {
   Serial.println("# attenuator,photodiode");
 
   int savedAttenuator = attenuatorValue;
+  bool halfFound = false;
 
   analogWrite(attenuatorPin, 0); // Start with no attenuation
+  delay(CAL_SETTLE_MS);
   int maxVal = analogRead(photodiodePin);
 
   for (int val = 0; val <= DAC_MAX; val += CAL_STEP) {
@@ -38,11 +40,14 @@ void calibrate() {
     Serial.print(val);
     Serial.print(",");
     Serial.println(pd);
-    // If photodiode reading is half of first value we save the value
-    if (pd < maxVal / 2) {
+    // Save attenuator and reference only the first time PD drops below half-max
+    if (!halfFound && pd < maxVal / 2) {
       savedAttenuator = val;
+      referenceValue = pd;
+      halfFound = true;
+      Serial.print("# Reference updated to: ");
+      Serial.println(referenceValue);
     }
-
   }
 
   // Restore previous attenuator value
@@ -53,6 +58,7 @@ void calibrate() {
 }
 
 void setup() {
+  analogReadResolution(14); //change to 14-bit resolution
   pinMode(attenuatorPin, OUTPUT);
   pinMode(photodiodePin, INPUT);
   Serial.begin(9600);
@@ -63,7 +69,7 @@ void setup() {
   analogWriteResolution(12); // Set 12-bit resolution if supported
 #endif
   analogWrite(attenuatorPin, attenuatorValue);
-  delay(1000); // Wait for system to settle
+  delay(100); // Wait for system to settle
   referenceValue = analogRead(photodiodePin);
   Serial.print("Reference set to: ");
   Serial.println(referenceValue);
@@ -71,20 +77,11 @@ void setup() {
   Serial.println("Send 'cal' to run attenuator calibration sweep.");
 }
 
-
-
 void loop() {
   int currentValue = analogRead(photodiodePin);
   int error = referenceValue - currentValue;
 
-  // Serial monitoring
-  Serial.print("Photodiode: ");
-  Serial.print(currentValue);
-  Serial.print(" | Reference: ");
-  Serial.print(referenceValue);
-  Serial.print(" | Attenuator: ");
-  Serial.println(attenuatorValue);
-
+  
   // Serial commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
@@ -95,8 +92,21 @@ void loop() {
       Serial.println(referenceValue);
     } else if (cmd.equalsIgnoreCase("cal")) {
       calibrate();
+    } else if (cmd.equalsIgnoreCase("get")) {
+      Serial.print("Photodiode: ");
+      Serial.print(currentValue);
+      Serial.print(" | Reference: ");
+      Serial.print(referenceValue);
+      Serial.print(" | Attenuator: ");
+      Serial.println(attenuatorValue);
+    } else if (cmd.equalsIgnoreCase("setZeroAttenuation")) {
+      analogWrite(attenuatorPin, 0);
+      delay(10);
+      Serial.print("Set to zero attenuation, photodiode value:");
+      int pdVal = analogRead(photodiodePin);
+      Serial.println(pdVal);
     }
-  }
+  } // end Serial.available()
 
   if (abs(error) > tolerance) {
     attenuatorValue += (error > 0) ? -step : step;
@@ -104,5 +114,5 @@ void loop() {
     analogWrite(attenuatorPin, attenuatorValue);
   }
 
-  delay(10); // Increased delay for serial readability
+  delay(10);
 }
