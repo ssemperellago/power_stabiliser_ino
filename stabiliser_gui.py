@@ -105,6 +105,11 @@ class StabiliserSerial:
         if self.connected and self.ser and self.ser.is_open:
             self.ser.write(b"set\n")
 
+    def send_setref(self, value: int):
+        """Set referenceValue to an explicit photodiode count."""
+        if self.connected and self.ser and self.ser.is_open:
+            self.ser.write(f"setref {int(value)}\n".encode())
+
     def send_cal(self):
         """Start a calibration sweep. Poll get_cal_result() for completion."""
         if not (self.connected and self.ser and self.ser.is_open):
@@ -249,6 +254,22 @@ class PM16Controller:
             time.sleep(0.2)
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _histogram(values: list[float], n_bins: int) -> tuple[list[int], list[float]]:
+    """Minimal histogram returning (counts, edges) without numpy."""
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return [len(values)], [lo, hi + 1e-9]
+    width = (hi - lo) / n_bins
+    edges = [lo + i * width for i in range(n_bins + 1)]
+    counts = [0] * n_bins
+    for v in values:
+        idx = min(int((v - lo) / width), n_bins - 1)
+        counts[idx] += 1
+    return counts, edges
+
+
 # ─── GUI ─────────────────────────────────────────────────────────────────────
 
 MAX_PLOT_POINTS = 500
@@ -340,14 +361,26 @@ class StabiliserGUI:
 
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
 
-        # Set point + Calibrate
+        # Set point — capture current or enter explicit value
+        ttk.Label(frame, text="Set point:").pack(anchor=tk.W)
+
         sp_row = ttk.Frame(frame)
-        sp_row.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(sp_row, text="Set point:").pack(side=tk.LEFT)
+        sp_row.pack(fill=tk.X, pady=(0, 2))
         self._stab_set_btn = ttk.Button(sp_row, text="Capture current →",
                                         command=self._capture_setpoint,
                                         state=tk.DISABLED)
-        self._stab_set_btn.pack(side=tk.LEFT, padx=6)
+        self._stab_set_btn.pack(side=tk.LEFT)
+
+        sp_val_row = ttk.Frame(frame)
+        sp_val_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(sp_val_row, text="Value:").pack(side=tk.LEFT)
+        self._setref_var = tk.IntVar(value=0)
+        ttk.Spinbox(sp_val_row, from_=0, to=16383, increment=1, width=7,
+                    textvariable=self._setref_var).pack(side=tk.LEFT, padx=4)
+        self._stab_setref_btn = ttk.Button(sp_val_row, text="Set →",
+                                           command=self._send_setref,
+                                           state=tk.DISABLED)
+        self._stab_setref_btn.pack(side=tk.LEFT)
 
         self._cal_btn = ttk.Button(frame, text="Calibrate",
                                    command=self._run_calibration,
@@ -433,12 +466,19 @@ class StabiliserGUI:
         power_tab = ttk.Frame(self._notebook)
         self._notebook.add(power_tab, text="  Power vs Time  ")
 
-        self._fig_power = Figure(figsize=(6, 4), dpi=100)
-        self._ax_power = self._fig_power.add_subplot(111)
+        self._fig_power = Figure(figsize=(7, 4), dpi=100)
+        gs = self._fig_power.add_gridspec(1, 2, width_ratios=[4, 1], wspace=0.05)
+        self._ax_power = self._fig_power.add_subplot(gs[0])
+        self._ax_hist  = self._fig_power.add_subplot(gs[1], sharey=self._ax_power)
+
         self._ax_power.set_xlabel("Time (s)")
         self._ax_power.set_ylabel("Power (mW)")
         self._ax_power.set_title("PM16 Live Power")
-        (self._power_line,) = self._ax_power.plot([], [], "b-", linewidth=1)
+        (self._power_line,) = self._ax_power.plot([], [], color="#00aacc", linewidth=1)
+
+        self._ax_hist.set_xlabel("Counts\n(norm.)")
+        self._ax_hist.tick_params(labelleft=False)
+        self._ax_hist.set_title("Hist.")
         self._fig_power.tight_layout()
 
         canvas_power = FigureCanvasTkAgg(self._fig_power, master=power_tab)
@@ -515,12 +555,14 @@ class StabiliserGUI:
             self._stab_conn_lbl.config(text="● Connected", fg="#008800")
             self._stab_get_btn.config(state=tk.NORMAL)
             self._stab_en_btn.config(state=tk.NORMAL)
+            self._stab_setref_btn.config(state=tk.NORMAL)
         else:
             self._stab_conn_btn.config(text="Connect")
             self._stab_conn_lbl.config(text="● Disconnected", fg="red")
             self._stab_get_btn.config(state=tk.DISABLED)
             self._stab_en_btn.config(text="Enable Stabiliser", state=tk.DISABLED)
             self._stab_set_btn.config(state=tk.DISABLED)
+            self._stab_setref_btn.config(state=tk.DISABLED)
             self._cal_btn.config(state=tk.DISABLED)
             self._cal_status_var.set("")
             self._stab_enabled = False
@@ -571,6 +613,14 @@ class StabiliserGUI:
 
     def _send_get(self):
         self.stabiliser.send_get()
+
+    def _send_setref(self):
+        try:
+            value = int(self._setref_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Invalid value", "Enter an integer photodiode count.")
+            return
+        self.stabiliser.send_setref(value)
 
     def _capture_setpoint(self):
         if not self.stabiliser.connected:
@@ -644,6 +694,10 @@ class StabiliserGUI:
         self._mean_var.set("— mW")
         self._std_var.set("— mW")
         self._ax_power.relim()
+        self._ax_hist.cla()
+        self._ax_hist.tick_params(labelleft=False)
+        self._ax_hist.set_xlabel("Counts\n(norm.)")
+        self._ax_hist.set_title("Hist.")
         self._canvas_power.draw_idle()
 
     # ── Calibration plot ──────────────────────────────────────────────────────
@@ -757,19 +811,37 @@ class StabiliserGUI:
             self._mean_var.set(f"{mean:.4f} mW")
             self._std_var.set(f"{std:.4f} mW")
 
-            # Annotate plot with mean ± std band
+            # ── Mean ± std on time-series ─────────────────────────────────────
             if hasattr(self, "_stats_hlines"):
                 for artist in self._stats_hlines:
                     artist.remove()
             mean_line = self._ax_power.axhline(
-                mean, color="orange", linestyle="--", linewidth=1, label=f"Mean ({mean:.4f} mW)")
+                mean, color="orange", linestyle="--", linewidth=1,
+                label=f"Mean ({mean:.4f} mW)")
             band = self._ax_power.axhspan(
                 mean - std, mean + std, alpha=0.12, color="orange",
                 label=f"±1σ ({std:.4f} mW)")
             self._stats_hlines = [mean_line, band]
-
-            # Refresh legend
             self._ax_power.legend(fontsize=7, loc="upper left")
+
+            # ── Histogram (horizontal, shares y-axis) ─────────────────────────
+            self._ax_hist.cla()
+            self._ax_hist.tick_params(labelleft=False)
+            self._ax_hist.set_xlabel("Counts\n(norm.)")
+            self._ax_hist.set_title("Hist.")
+
+            n_bins = min(50, max(10, len(window_vals) // 5))
+            counts, edges = _histogram(window_vals, n_bins)
+            norm = max(counts) if max(counts) > 0 else 1.0
+            counts_norm = [c / norm for c in counts]
+            bin_centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(counts))]
+            bin_width = edges[1] - edges[0]
+
+            self._ax_hist.barh(bin_centers, counts_norm, height=bin_width * 0.9,
+                               color="#00aacc", alpha=0.6)
+            self._ax_hist.axhline(mean, color="orange", linestyle="--", linewidth=1)
+            self._ax_hist.axhspan(mean - std, mean + std, alpha=0.12, color="orange")
+            self._ax_hist.set_xlim(left=0)
 
         self._canvas_power.draw_idle()
 

@@ -92,6 +92,11 @@ void loop() {
       Serial.println(referenceValue);
     } else if (cmd.equalsIgnoreCase("cal")) {
       calibrate();
+    } else if (cmd.startsWith("setref ")) {
+      int val = cmd.substring(7).toInt();
+      referenceValue = val;
+      Serial.print("Reference set to: ");
+      Serial.println(referenceValue);
     } else if (cmd.equalsIgnoreCase("get")) {
       Serial.print("Photodiode: ");
       Serial.print(currentValue);
