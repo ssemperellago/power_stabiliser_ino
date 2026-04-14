@@ -288,6 +288,11 @@ class StabiliserGUI:
         self._power_times: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
         self._power_values: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
         self._t0: float | None = None
+
+        self._pd_times: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
+        self._pd_values: deque[float] = deque(maxlen=MAX_PLOT_POINTS)
+        self._pd_t0: float | None = None
+
         self._calibrating_ui = False   # tracks whether cal is in progress in the GUI
 
         self._build_ui()
@@ -391,6 +396,28 @@ class StabiliserGUI:
         ttk.Label(frame, textvariable=self._cal_status_var,
                   foreground="gray", font=("TkDefaultFont", 8)).pack(anchor=tk.W)
 
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # Photodiode plot statistics
+        ttk.Label(frame, text="Photodiode plot:", font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
+        pd_stats_grid = ttk.Frame(frame)
+        pd_stats_grid.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(pd_stats_grid, text="Stats window:").grid(row=0, column=0, sticky=tk.W)
+        self._pd_stats_window_var = tk.DoubleVar(value=10.0)
+        ttk.Spinbox(pd_stats_grid, from_=1, to=3600, increment=1, width=6,
+                    textvariable=self._pd_stats_window_var).grid(row=0, column=1, padx=4)
+        ttk.Label(pd_stats_grid, text="s").grid(row=0, column=2, sticky=tk.W)
+
+        ttk.Label(pd_stats_grid, text="Mean:").grid(row=1, column=0, sticky=tk.W, pady=1)
+        self._pd_mean_var = tk.StringVar(value="—")
+        ttk.Label(pd_stats_grid, textvariable=self._pd_mean_var).grid(row=1, column=1,
+                                                                       columnspan=2, sticky=tk.W)
+        ttk.Label(pd_stats_grid, text="Std dev:").grid(row=2, column=0, sticky=tk.W, pady=1)
+        self._pd_std_var = tk.StringVar(value="—")
+        ttk.Label(pd_stats_grid, textvariable=self._pd_std_var).grid(row=2, column=1,
+                                                                      columnspan=2, sticky=tk.W)
+        ttk.Button(frame, text="Clear PD plot", command=self._clear_pd_plot).pack(fill=tk.X)
+
     def _build_pm_panel(self, parent):
         frame = ttk.LabelFrame(parent, text=" Power Meter (PM16) ", padding=8)
         frame.pack(fill=tk.X)
@@ -485,6 +512,30 @@ class StabiliserGUI:
         canvas_power.draw()
         canvas_power.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._canvas_power = canvas_power
+
+        # ── Tab 2: Photodiode vs Time ─────────────────────────────────────────
+        pd_tab = ttk.Frame(self._notebook)
+        self._notebook.add(pd_tab, text="  Photodiode vs Time  ")
+
+        self._fig_pd = Figure(figsize=(7, 4), dpi=100)
+        gs_pd = self._fig_pd.add_gridspec(1, 2, width_ratios=[4, 1], wspace=0.05)
+        self._ax_pd      = self._fig_pd.add_subplot(gs_pd[0])
+        self._ax_pd_hist = self._fig_pd.add_subplot(gs_pd[1], sharey=self._ax_pd)
+
+        self._ax_pd.set_xlabel("Time (s)")
+        self._ax_pd.set_ylabel("Photodiode (ADC)")
+        self._ax_pd.set_title("Photodiode Live Value")
+        (self._pd_line,) = self._ax_pd.plot([], [], color="#00cc88", linewidth=1)
+
+        self._ax_pd_hist.set_xlabel("Counts\n(norm.)")
+        self._ax_pd_hist.tick_params(labelleft=False)
+        self._ax_pd_hist.set_title("Hist.")
+        self._fig_pd.tight_layout()
+
+        canvas_pd = FigureCanvasTkAgg(self._fig_pd, master=pd_tab)
+        canvas_pd.draw()
+        canvas_pd.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._canvas_pd = canvas_pd
 
         # ── Tab 3: Arduino terminal ───────────────────────────────────────────
         term_tab = ttk.Frame(self._notebook)
@@ -700,6 +751,81 @@ class StabiliserGUI:
         self._ax_hist.set_title("Hist.")
         self._canvas_power.draw_idle()
 
+    def _update_pd_plot(self):
+        if not self._pd_times:
+            return
+
+        times = list(self._pd_times)
+        values = list(self._pd_values)
+        self._pd_line.set_data(times, values)
+        self._ax_pd.relim()
+        self._ax_pd.autoscale_view()
+
+        try:
+            window = float(self._pd_stats_window_var.get())
+        except (tk.TclError, ValueError):
+            window = 10.0
+        t_now = times[-1]
+        window_vals = [v for t, v in zip(times, values) if t >= t_now - window]
+
+        if window_vals:
+            mean = sum(window_vals) / len(window_vals)
+            variance = sum((v - mean) ** 2 for v in window_vals) / len(window_vals)
+            std = variance ** 0.5
+            self._pd_mean_var.set(f"{mean:.1f} ADC")
+            self._pd_std_var.set(f"{std:.2f} ADC")
+
+            if hasattr(self, "_pd_stats_hlines"):
+                for artist in self._pd_stats_hlines:
+                    artist.remove()
+            mean_line = self._ax_pd.axhline(
+                mean, color="orange", linestyle="--", linewidth=1,
+                label=f"Mean ({mean:.1f})")
+            band = self._ax_pd.axhspan(
+                mean - std, mean + std, alpha=0.12, color="orange",
+                label=f"±1σ ({std:.2f})")
+            self._pd_stats_hlines = [mean_line, band]
+            self._ax_pd.legend(fontsize=7, loc="upper left")
+
+            self._ax_pd_hist.cla()
+            self._ax_pd_hist.tick_params(labelleft=False)
+            self._ax_pd_hist.set_xlabel("Counts\n(norm.)")
+            self._ax_pd_hist.set_title("Hist.")
+
+            n_bins = min(50, max(10, len(window_vals) // 5))
+            counts, edges = _histogram(window_vals, n_bins)
+            norm = max(counts) if max(counts) > 0 else 1.0
+            counts_norm = [c / norm for c in counts]
+            bin_centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(counts))]
+            bin_width = edges[1] - edges[0]
+
+            self._ax_pd_hist.barh(bin_centers, counts_norm, height=bin_width * 0.9,
+                                  color="#00cc88", alpha=0.6)
+            self._ax_pd_hist.axhline(mean, color="orange", linestyle="--", linewidth=1)
+            self._ax_pd_hist.axhspan(mean - std, mean + std, alpha=0.12, color="orange")
+            self._ax_pd_hist.set_xlim(left=0)
+
+        self._canvas_pd.draw_idle()
+
+    def _clear_pd_plot(self):
+        self._pd_times.clear()
+        self._pd_values.clear()
+        self._pd_t0 = None
+        self._pd_line.set_data([], [])
+        if hasattr(self, "_pd_stats_hlines"):
+            for artist in self._pd_stats_hlines:
+                artist.remove()
+            self._pd_stats_hlines = []
+        self._ax_pd.legend().remove() if self._ax_pd.get_legend() else None
+        self._pd_mean_var.set("—")
+        self._pd_std_var.set("—")
+        self._ax_pd.relim()
+        self._ax_pd_hist.cla()
+        self._ax_pd_hist.tick_params(labelleft=False)
+        self._ax_pd_hist.set_xlabel("Counts\n(norm.)")
+        self._ax_pd_hist.set_title("Hist.")
+        self._canvas_pd.draw_idle()
+
     # ── Calibration plot ──────────────────────────────────────────────────────
 
     def _draw_calibration_plot(self, data: list[tuple[int, int]]):
@@ -754,6 +880,12 @@ class StabiliserGUI:
                 self._stab_vars["reference"].set(str(ref))
                 self._stab_vars["attenuator"].set(str(att))
                 self._stab_vars["error"].set(str(ref - pd) if ref is not None else "—")
+                if self._pd_t0 is None:
+                    self._pd_t0 = time.time()
+                t = time.time() - self._pd_t0
+                self._pd_times.append(t)
+                self._pd_values.append(float(pd))
+                self._update_pd_plot()
 
         # Calibration completion check
         if self._calibrating_ui:
@@ -764,7 +896,7 @@ class StabiliserGUI:
                 self._stab_get_btn.config(state=tk.NORMAL)
                 self._cal_status_var.set(f"Done — {len(data)} points")
                 self._draw_calibration_plot(data)
-                self._notebook.select(2)   # switch to Calibration tab
+                self._notebook.select(3)   # switch to Calibration tab
 
         # Arduino terminal
         if self.stabiliser.connected:
